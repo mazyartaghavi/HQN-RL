@@ -1,0 +1,422 @@
+2. Start CARLA simulator (or use the mock env).
+3. Run training:
+
+
+
+### Quantum hardware
+- Configure PennyLane to use `default.qubit` for simulation.
+- To run on IBMQ/IonQ, follow PennyLane device docs and set provider credentials in `~/.config/pennylane`.
+
+### Neuromorphic hardware
+- The software SNN uses Norse. For Loihi support, use Intel Lava and port `snn_actor.py` functions to Lava primitives.
+
+### License
+MIT
+
+
+  # src/env/env_wrapper.py
+import numpy as np
+import time
+import random
+from dataclasses import dataclass
+
+try:
+    import carla
+    CARLA_AVAILABLE = True
+except Exception:
+    CARLA_AVAILABLE = False
+
+@dataclass
+class EnvConfig:
+    dt: float = 0.02
+    max_episode_steps: int = 500
+    render: bool = False
+
+class MockEnv:
+    """
+    Simple mock environment for testing without CARLA. State representation:
+    s = [x, y, yaw, v, lidar_feat0, lidar_feat1, ...]
+    """
+
+    def __init__(self, config: EnvConfig = EnvConfig()):
+        self.config = config
+        self.step_count = 0
+        self.state_dim = 8
+        self.action_dim = 2  # throttle, steering
+        self.reset()
+
+    def reset(self):
+        self.step_count = 0
+        # Random initial state [x,y,yaw,v,...]
+        self.state = np.zeros(self.state_dim, dtype=np.float32)
+        self.state[0:2] = np.random.uniform(-1.0, 1.0, size=2)
+        self.state[3] = np.random.uniform(0.0, 1.0)  # speed
+        return self._get_obs()
+
+    def _get_obs(self):
+        # return observation vector
+        return self.state.copy()
+
+    def step(self, action):
+        # simple kinematic update
+        throttle, steer = np.clip(action, -1.0, 1.0)
+        dt = self.config.dt
+        x, y, yaw, v = self.state[0], self.state[1], self.state[2], self.state[3]
+        v = max(0.0, v + throttle * dt)
+        yaw += steer * dt
+        x += v * np.cos(yaw) * dt
+        y += v * np.sin(yaw) * dt
+        # add simple noise
+        self.state[0:4] = np.array([x, y, yaw, v])
+        # placeholder reward and done
+        reward = -0.01 * v**2
+        done = (self.step_count >= self.config.max_episode_steps-1)
+        self.step_count += 1
+        info = {}
+        return self._get_obs(), reward, done, info
+
+class CarlaEnv:
+    def __init__(self, config: EnvConfig = EnvConfig(), host='localhost', port=2000):
+        if not CARLA_AVAILABLE:
+            raise RuntimeError("CARLA is not available. Use MockEnv.")
+        self.client = carla.Client(host, port)
+        self.client.set_timeout(10.0)
+        self.world = self.client.get_world()
+        # More initialization required for sensors, vehicle actors, etc.
+        self._setup()
+    def _setup(self):
+        pass
+    def reset(self):
+        pass
+    def step(self, action):
+        pass
+
+def make_env(cfg: EnvConfig = EnvConfig()):
+    if CARLA_AVAILABLE:
+        return CarlaEnv(cfg)
+    else:
+        return MockEnv(cfg)
+
+  # src/quantum/q_optimizer.py
+import pennylane as qml
+from pennylane import numpy as np
+import torch
+from typing import Optional
+
+class QuantumPolicyEmbedder:
+    """
+    Small variational quantum circuit that encodes state -> latent vector z.
+    Uses PennyLane; can be run on default.qubit or mapped to hardware.
+    """
+
+    def __init__(self, n_qubits=4, n_layers=2, device='default.qubit'):
+        self.n_qubits = n_qubits
+        self.n_layers = n_layers
+        self.dev = qml.device(device, wires=self.n_qubits)
+        # parameter vector
+        self.theta = np.random.randn(self.n_layers * self.n_qubits, requires_grad=True)
+
+        @qml.qnode(self.dev, interface='autograd')
+        def circuit(inputs, theta):
+            # inputs: classical vector (state)
+            # angle encode first min(len(inputs), n_qubits) entries
+            for i in range(self.n_qubits):
+                angle = float(inputs[i % len(inputs)]) if len(inputs) > 0 else 0.0
+                qml.RY(angle, wires=i)
+            # variational layers
+            idx = 0
+            for _ in range(self.n_layers):
+                for q in range(self.n_qubits):
+                    qml.RY(theta[idx], wires=q)
+                    idx += 1
+                for q in range(self.n_qubits - 1):
+                    qml.CNOT(wires=[q, q + 1])
+            # Measure PauliZ expectations as a latent vector
+            return [qml.expval(qml.PauliZ(wires=i)) for i in range(self.n_qubits)]
+
+        self.circuit = circuit
+
+    def embed(self, state: np.ndarray):
+        # state should be a numpy array; pad/truncate to n_qubits
+        s = np.array(state, dtype=float)
+        return np.array(self.circuit(s, self.theta), dtype=float)
+
+    def set_params(self, new_theta):
+        self.theta = np.array(new_theta, requires_grad=True)
+
+    def get_params(self):
+        return self.theta
+
+    def optimize_once(self, loss_fn, lr=0.1):
+        """
+        Performs one optimization step using autograd.
+        `loss_fn` should accept a function that maps theta -> loss.
+        """
+        grad = qml.grad(loss_fn)(self.theta)
+        self.theta = self.theta - lr * grad
+        return float(loss_fn(self.theta))
+
+  # src/neuromorphic/snn_actor.py
+import torch
+import torch.nn as nn
+import norse.torch as norse
+
+class SNNActor(nn.Module):
+    """
+    Spiking actor implemented using Norse (surrogate gradients).
+    Inputs: vector observation -> optional quantum embedding concatenated
+    Outputs: continuous action (throttle, steering) via readout from spike traces.
+    """
+
+    def __init__(self, obs_dim, hidden=128, action_dim=2):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.hidden = hidden
+        self.action_dim = action_dim
+
+        self.fc1 = nn.Linear(obs_dim, hidden)
+        self.lif1 = norse.LIFCell()
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.lif2 = norse.LIFCell()
+        # readout - map spike traces to continuous action via linear layer
+        self.readout = nn.Linear(hidden, action_dim)
+        # optional tanh to keep actions within [-1,1]
+        self.act_out = nn.Tanh()
+
+    def forward(self, x, lif_state=None):
+        # x: batch x obs_dim
+        x = self.fc1(x)
+        z1, s1 = self.lif1(x, None)
+        x = self.fc2(z1)
+        z2, s2 = self.lif2(x, None)
+        # readout from membrane/spike activity
+        out = self.readout(z2)
+        return self.act_out(out)
+
+    def step(self, x):
+        with torch.no_grad():
+            return self.forward(x.unsqueeze(0)).squeeze(0).cpu().numpy()
+
+  # src/utils/replay_buffer.py
+import random
+import numpy as np
+from collections import deque
+
+class ReplayBuffer:
+    def __init__(self, capacity=100000):
+        self.capacity = capacity
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append( (state, action, reward, next_state, done) )
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        s, a, r, ns, d = zip(*batch)
+        return np.array(s), np.array(a), np.array(r), np.array(ns), np.array(d)
+
+    def __len__(self):
+        return len(self.buffer)
+
+  # src/utils/safety.py
+import numpy as np
+
+def project_action_to_safe(action, state, constraints):
+    """
+    A placeholder safe-action projection. For production, solve a small QP
+    to project the proposed action to the set satisfying h_j(s,a)>=0.
+    Here we simply clip and apply heuristics.
+    """
+    # Example: clip throttle & steering
+    throttle = np.clip(action[0], -1.0, 1.0)
+    steer = np.clip(action[1], -0.6, 0.6)
+    # if close to obstacle, reduce throttle
+    dist_to_obstacle = constraints.get('dist', 100.0)
+    if dist_to_obstacle < 0.5:
+        throttle = min(throttle, 0.2)
+    return np.array([throttle, steer])
+
+  # src/agent.py
+import numpy as np
+import torch
+from .quantum.q_optimizer import QuantumPolicyEmbedder
+from .neuromorphic.snn_actor import SNNActor
+from .utils.replay_buffer import ReplayBuffer
+from .utils.safety import project_action_to_safe
+
+class HQNAgent:
+    def __init__(self, obs_dim, action_dim, cfg):
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        # quantum embedder
+        self.q_embedder = QuantumPolicyEmbedder(n_qubits=cfg['quantum']['n_qubits'],
+                                                n_layers=cfg['quantum']['n_layers'],
+                                                device=cfg['quantum'].get('device', 'default.qubit'))
+        # neuromorphic actor
+        emb_dim = self.q_embedder.n_qubits
+        total_in = obs_dim + emb_dim
+        self.actor = SNNActor(obs_dim + emb_dim, hidden=cfg['snn']['hidden'], action_dim=action_dim)
+        self.replay = ReplayBuffer(cfg.get('replay_size', 50000))
+        # optimizers for actor (surrogate gradient)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg['snn']['lr'])
+
+    def select_action(self, state_np):
+        # get quantum embedding
+        z = self.q_embedder.embed(state_np[:self.obs_dim])
+        # compose input
+        inp = np.concatenate([state_np, np.asarray(z)], axis=0)
+        inp_tensor = torch.tensor(inp, dtype=torch.float32)
+        action = self.actor.step(inp_tensor)  # returns numpy array continuous in [-1,1]
+        return action
+
+    def store_transition(self, s,a,r,ns,d):
+        self.replay.push(s,a,r,ns,d)
+
+    def update(self, batch_size=64):
+        if len(self.replay) < batch_size:
+            return
+        s,a,r,ns,d = self.replay.sample(batch_size)
+        # Build training tensors
+        # Example: simple policy gradient surrogate: maximize rewards by updating actor readout
+        # For production, implement proper policy gradient or actor-critic using critic networks
+        # Here we use a simple supervised surrogate: predict action that yields higher reward
+        s_tensor = torch.tensor(s, dtype=torch.float32)
+        a_tensor = torch.tensor(a, dtype=torch.float32)
+        # forward
+        pred = self.actor.forward(s_tensor)
+        loss = torch.nn.functional.mse_loss(pred, a_tensor)  # surrogate
+        self.actor_opt.zero_grad()
+        loss.backward()
+        self.actor_opt.step()
+        return loss.item()
+
+# src/train.py
+import argparse
+import yaml
+import numpy as np
+import torch
+from src.env.env_wrapper import make_env, EnvConfig
+from src.agent import HQNAgent
+
+def load_config(path):
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
+
+def main(cfg_path):
+    cfg = load_config(cfg_path)
+    env_cfg = EnvConfig(**cfg.get('env', {}))
+    env = make_env(env_cfg)
+    obs = env.reset()
+    obs_dim = env.state_dim
+    action_dim = env.action_dim
+    agent = HQNAgent(obs_dim, action_dim, cfg)
+
+    num_episodes = cfg.get('train', {}).get('episodes', 1000)
+    max_steps = env_cfg.max_episode_steps
+
+    for ep in range(num_episodes):
+        s = env.reset()
+        ep_reward = 0.0
+        for t in range(max_steps):
+            a = agent.select_action(s)
+            # safety projection (simple)
+            a_safe = project_action_to_safe(a, s, constraints={'dist': 1.0})
+            ns, r, done, info = env.step(a_safe)
+            agent.store_transition(s, a_safe, r, ns, done)
+            loss = agent.update(batch_size=cfg.get('train', {}).get('batch_size', 64))
+            s = ns
+            ep_reward += r
+            if done:
+                break
+        print(f"Episode {ep} reward {ep_reward:.3f} loss {loss}")
+    print("Training complete.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('config', type=str, help='path to config yaml')
+    args = parser.parse_args()
+    main(args.config)
+
+  # src/evaluate.py
+import numpy as np
+import torch
+from src.env.env_wrapper import make_env, EnvConfig
+from src.agent import HQNAgent
+from src.utils.metrics import compute_metrics
+
+def evaluate_agent(agent: HQNAgent, env, episodes=10):
+    metrics_list = []
+    for ep in range(episodes):
+        s = env.reset()
+        done = False
+        traj = []
+        while not done:
+            a = agent.select_action(s)
+            a_safe = agent.q_embedder  # placeholder - apply safety
+            ns, r, done, info = env.step(a)
+            traj.append((s,a,r))
+            s = ns
+        metrics = compute_metrics(traj)
+        metrics_list.append(metrics)
+    return metrics_list
+
+  # src/sim_to_real/ros_nodes.py
+import rclpy
+from rclpy.node import Node
+# from std_msgs.msg import Float32MultiArray  # adjust according to messages used
+
+class ControlPublisher(Node):
+    def __init__(self):
+        super().__init__('hqnr_control_pub')
+        # self.pub = self.create_publisher(Float32MultiArray, 'vehicle/cmd', 10)
+        self.get_logger().info("HQN-RL control ROS node started")
+
+    def publish_action(self, action):
+        # msg = Float32MultiArray(data=list(action))
+        # self.pub.publish(msg)
+        self.get_logger().info(f"Publishing action: {action}")
+
+def main():
+    rclpy.init()
+    node = ControlPublisher()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
+
+  env:
+  dt: 0.02
+  max_episode_steps: 500
+  render: False
+
+quantum:
+  n_qubits: 4
+  n_layers: 2
+  device: default.qubit
+
+snn:
+  hidden: 128
+  lr: 1e-4
+
+train:
+  episodes: 200
+  batch_size: 64
+
+replay_size: 50000
+
+  #!/bin/bash
+CONFIG=${1:-experiments/example_config.yaml}
+python -m src.train $CONFIG
+
+  #!/bin/bash
+# Train then launch ROS2 control node to publish actions to real testbed
+CONFIG=${1:-experiments/example_config.yaml}
+python -m src.train $CONFIG
+# After training, run ROS node: (requires ROS2 installed)
+python -m src.sim_to_real.ros_nodes
+
+  MIT License
+Copyright (c) 2025 Mazyar Taghavi
+...
