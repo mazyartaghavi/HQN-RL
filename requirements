@@ -1,0 +1,35 @@
+# Core
+numpy>=1.22
+scipy
+pyyaml
+tqdm
+matplotlib
+pandas
+
+# RL and NN
+torch>=1.12
+torchvision
+norse==0.4.0      # SNN library on top of PyTorch (fallback neuromorphic implementation)
+stable-baselines3
+
+# Quantum (PennyLane)
+pennylane>=0.27
+pennylane-qiskit>=0.22    # optional, only if using IBMQ backend
+pennylane-lightning>=0.28
+
+# Simulation / middleware
+carla==0.9.13          # match your CARLA server version or provide a mock fallback
+ros2==0.0.0            # placeholder in requirements; ROS2 installed via OS package manager
+grpcio
+
+# Utils
+scikit-learn
+joblib
+
+# For plotting & logging
+tensorboard
+wandb    # optional
+
+# Development
+black
+flake8
